@@ -9,6 +9,26 @@ import torch
 from google.cloud import aiplatform, bigquery
 from transformers import AutoModel, AutoTokenizer
 
+from abc import ABC, abstractmethod
+
+
+class BaseRetriever(ABC):
+    @abstractmethod
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        context: Optional[Dict[str, Any]] = None,
+    ):
+        """Return a list of RetrievedItem"""
+        pass
+
+    @property
+    @abstractmethod
+    def is_enabled(self) -> bool:
+        pass
+
+
 logger = logging.getLogger("retrieval")
 logger.setLevel(logging.INFO)
 
@@ -28,8 +48,7 @@ class RetrievedItem:
     other_links: List[str]
     similarity: float 
 
-
-class Retriever:
+class VertexRetriever(BaseRetriever):
     """
     Vertex AI Matching Engine retriever.
 
@@ -43,7 +62,7 @@ class Retriever:
       - EMBED_MODEL_NAME         default: nomic-ai/nomic-embed-text-v1.5
       - BQ_DATASET_ID            default: ks_metadata
       - BQ_TABLE_ID              default: docstore
-      - BQ_LOCATION              default: US
+      - BQ_LOCATION              default: EU
       - EMBED_MAX_TOKENS         default: 1024
       - QUERY_CHAR_LIMIT         default: 8000
     """
@@ -145,7 +164,7 @@ class Retriever:
         cfg = bigquery.QueryJobConfig(
             query_parameters=[bigquery.ArrayQueryParameter("ids", "STRING", ids)]
         )
-        rows = self.bq.query(sql, job_config=cfg, location=self.bq_location).result()
+        rows = self.bq.query(sql, job_config=cfg, location=self.bq_location).result(timeout=10)
         out: Dict[str, Dict[str, Any]] = {}
         for r in rows:
             md = r.metadata_filters
@@ -171,7 +190,7 @@ class Retriever:
         if not self.is_enabled or not query:
             return []
 
-        qtext = query if (context or {}).get("raw") else query
+        qtext = query
 
         try:
             vec = self._embed(qtext)
@@ -212,9 +231,14 @@ class Retriever:
                     or ""
                 )
                 try:
+                    # Vertex AI returns L2 distance (lower is better), so we negate it for descending similarity sort
                     similarity = -float(dist) if dist is not None else 0.0
                 except Exception:
                     similarity = 0.0
+
+                other_links = md.get("other_links", [])
+                if not isinstance(other_links, list):
+                    other_links = []
 
                 items.append(
                     RetrievedItem(
@@ -223,7 +247,7 @@ class Retriever:
                         content=str(content),
                         metadata=md,
                         primary_link=link,
-                        other_links=[],
+                        other_links=other_links,
                         similarity=similarity,
                     )
                 )
@@ -233,3 +257,21 @@ class Retriever:
         except Exception as e:
             logger.error(f"Matching Engine search failed: {e}")
             return []
+
+
+
+
+
+def get_retriever() -> BaseRetriever:
+    """
+    Factory for creating a retriever instance.
+    Falls back to local retriever when Vertex is unavailable.
+    """
+    vertex = VertexRetriever()
+    if vertex.is_enabled:
+        return vertex
+
+    from local_retriever import LocalRetriever
+    logger.info("Vertex retriever unavailable. Falling back to LocalRetriever.")
+    return LocalRetriever()
+
